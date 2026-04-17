@@ -351,6 +351,48 @@ if torch is not None:  # pragma: no cover
                 raise RuntimeError("Encoder normalization stats are not fitted.")
             return (X - self.mean) / self.std
 
+        def _initial_infer_batch_size(self, n_samples: int) -> int:
+            return min(max(1, self.batch_size), max(1, int(n_samples)))
+
+        def _maybe_empty_cuda_cache(self) -> None:
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        def _encode_in_batches(self, model: _ConvAutoEncoder, X_np: np.ndarray) -> np.ndarray:
+            X_arr = np.asarray(X_np, dtype=np.float32)
+            if X_arr.ndim != 3:
+                raise ValueError("Torch CNN encoder expects 3D input (n, time, channels).")
+
+            n_samples = int(X_arr.shape[0])
+            latent_dim = max(1, int(model.fc_latent.out_features))
+            if n_samples == 0:
+                return np.empty((0, latent_dim), dtype=np.float32)
+
+            batch_size = self._initial_infer_batch_size(n_samples)
+            while True:
+                outputs = []
+                try:
+                    model.eval()
+                    with torch.no_grad():
+                        for start in range(0, n_samples, batch_size):
+                            stop = min(n_samples, start + batch_size)
+                            batch_np = np.ascontiguousarray(X_arr[start:stop], dtype=np.float32)
+                            batch_x = torch.from_numpy(batch_np).to(
+                                self.device,
+                                non_blocking=self.device.type == "cuda",
+                            )
+                            batch_z = model.encode(batch_x).detach().cpu().numpy().astype(np.float32, copy=False)
+                            outputs.append(batch_z)
+                            del batch_x
+                    return np.vstack(outputs).astype(np.float32, copy=False)
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    if batch_size <= 1:
+                        raise
+                    self._maybe_empty_cuda_cache()
+                    batch_size = max(1, batch_size // 2)
+
         def _fit_one(self, model: _ConvAutoEncoder, X_np: np.ndarray) -> _ConvAutoEncoder:
             ds = TensorDataset(torch.from_numpy(X_np))
             loader = DataLoader(
@@ -364,7 +406,7 @@ if torch is not None:  # pragma: no cover
             model.train()
             for _ in range(max(1, self.epochs)):
                 for (batch_x,) in loader:
-                    batch_x = batch_x.to(self.device)
+                    batch_x = batch_x.to(self.device, non_blocking=self.device.type == "cuda")
                     optim.zero_grad()
                     rec, _ = model(batch_x)
                     loss = criterion(rec, batch_x)
@@ -422,25 +464,21 @@ if torch is not None:  # pragma: no cover
 
         def transform(self, X: np.ndarray) -> np.ndarray:
             X_arr = np.asarray(X, dtype=np.float32)
+            if X_arr.ndim != 3:
+                raise ValueError("Torch CNN encoder expects 3D input (n, time, channels).")
             X_norm = self._normalize(X_arr)
-            with torch.no_grad():
-                if self.axis_mode == "per_axis":
-                    if not self.axis_models:
-                        raise RuntimeError("Per-axis torch encoder is not fitted.")
-                    outs = []
-                    for ch, model in enumerate(self.axis_models):
-                        model.eval()
-                        xt = torch.from_numpy(X_norm[:, :, ch:ch + 1]).to(self.device)
-                        z = model.encode(xt).cpu().numpy().astype(np.float32, copy=False)
-                        outs.append(z)
-                    return np.hstack(outs).astype(np.float32, copy=False)
+            if self.axis_mode == "per_axis":
+                if not self.axis_models:
+                    raise RuntimeError("Per-axis torch encoder is not fitted.")
+                outs = []
+                for ch, model in enumerate(self.axis_models):
+                    z = self._encode_in_batches(model, X_norm[:, :, ch:ch + 1])
+                    outs.append(z)
+                return np.hstack(outs).astype(np.float32, copy=False)
 
-                if self.model is None:
-                    raise RuntimeError("Torch CNN encoder is not fitted.")
-                self.model.eval()
-                xt = torch.from_numpy(X_norm).to(self.device)
-                z = self.model.encode(xt).cpu().numpy()
-                return z.astype(np.float32, copy=False)
+            if self.model is None:
+                raise RuntimeError("Torch CNN encoder is not fitted.")
+            return self._encode_in_batches(self.model, X_norm)
 
         def fit_transform(self, X: np.ndarray) -> np.ndarray:
             self.fit(X)

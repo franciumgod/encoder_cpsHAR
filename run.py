@@ -171,7 +171,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--special_signal", default=False, help="Use predefined special signal combination channels.")
     parser.add_argument("--use_synth_signals", default=True, help="Keep Acc.norm / Gyro.norm channels.")
 
-    parser.add_argument("--feature_domain", default="time_freq", choices=["time", "freq", "time_freq"])
+    parser.add_argument("--feature_domain", default="time", choices=["time", "freq", "time_freq"])
     parser.add_argument("--spectrum_method", default="welch_psd", choices=["rfft", "welch_psd", "stft", "dwt"])
     parser.add_argument(
         "--sampling_feature_mode",
@@ -197,7 +197,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="auto=respect booleans; handcrafted_only=only basic handcrafted; encoder_only=only encoder latent; hybrid=both.",
     )
 
-    parser.add_argument("--use_rotation_augment", default=True)
+    parser.add_argument("--use_rotation_augment", default=False)
     parser.add_argument("--augment_count", type=int, default=2)
     parser.add_argument("--augment_target", default="multilabel,Lifting(raising),Lifting(lowering)")
     parser.add_argument("--rotation_plane", default="xz", choices=["xy", "xz", "yz", "xyz"])
