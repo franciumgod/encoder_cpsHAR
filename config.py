@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 
 
 BOOL_TRUE = {"1", "true", "yes", "y", "on"}
@@ -34,15 +34,16 @@ def parse_csv_ints(text: str, default: List[int]) -> List[int]:
 @dataclass
 class EncoderBlockConfig:
     # resolved at runtime
-    _ROOT: ClassVar[Path] = Path(__file__).resolve().parents[1]
+    _ROOT: ClassVar[Path] = Path(__file__).resolve().parent
 
     # project / path
     project_root: Path = _ROOT
-    data_dir: Path = _ROOT / "encoderblock" / "data"
-    output_dir: Path = _ROOT / "encoderblock" / "output"
+    data_dir: Path = _ROOT / "data"
+    output_dir: Path = _ROOT / "output"
 
     # dataset
-    raw_dataset_file: str = "cps_windows_2s_2000hz_step_500.pkl"
+    raw_dataset_file: str = "cps_data_multi_label.pkl"
+    window_dataset_file: Optional[str] = None
     step: int = 500
     window_seconds: float = 2.0
     sample_rate_hz: int = 2000

@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
-from lightgbm import LGBMClassifier
+
+try:
+    from lightgbm import LGBMClassifier
+except Exception:  # pragma: no cover
+    LGBMClassifier = None
 
 try:
     from xgboost import XGBClassifier
@@ -45,6 +49,8 @@ class MultiLabelTreeModel:
         self.meta = ModelMeta(model_type=self.model_type, n_classes=len(self.label_cols), fitted=False)
 
     def _build_lgbm(self):
+        if LGBMClassifier is None:
+            raise RuntimeError("lightgbm is not available in the current environment.")
         return LGBMClassifier(
             n_estimators=int(getattr(self.cfg, "lgbm_n_estimators", 500)),
             learning_rate=float(getattr(self.cfg, "lgbm_learning_rate", 0.05)),
@@ -137,4 +143,3 @@ class MultiLabelTreeModel:
     def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         prob = self.predict_proba(X)
         return (prob >= float(threshold)).astype(np.int8, copy=False)
-

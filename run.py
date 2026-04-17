@@ -3,20 +3,35 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-from .augment import apply_rotation_augmentation
-from .config import EncoderBlockConfig, parse_bool, parse_csv_ints
-from .data import load_window_payload, split_window_payload
-from .domain import build_feature_matrices
-from .encoder import EncoderProjector
-from .metrics import aggregate_fold_metrics, evaluate_one_fold, plot_confusion_and_timeline, to_jsonable
-from .sampling import build_sampling_views, normalize_downsample_method, normalize_sampling_mode
-from .tree_models import MultiLabelTreeModel
+if __package__ in {None, ""}:
+    PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+    if str(PACKAGE_PARENT) not in sys.path:
+        sys.path.insert(0, str(PACKAGE_PARENT))
+
+    from encoderblock.augment import apply_rotation_augmentation
+    from encoderblock.config import EncoderBlockConfig, parse_bool, parse_csv_ints
+    from encoderblock.domain import build_feature_matrices
+    from encoderblock.encoder import EncoderProjector
+    from encoderblock.metrics import aggregate_fold_metrics, evaluate_one_fold, plot_confusion_and_timeline, to_jsonable
+    from encoderblock.sampling import build_sampling_views, normalize_downsample_method, normalize_sampling_mode
+    from encoderblock.tree_models import MultiLabelTreeModel
+    from encoderblock.window_dataset import load_window_payload, split_window_payload
+else:
+    from .augment import apply_rotation_augmentation
+    from .config import EncoderBlockConfig, parse_bool, parse_csv_ints
+    from .domain import build_feature_matrices
+    from .encoder import EncoderProjector
+    from .metrics import aggregate_fold_metrics, evaluate_one_fold, plot_confusion_and_timeline, to_jsonable
+    from .sampling import build_sampling_views, normalize_downsample_method, normalize_sampling_mode
+    from .tree_models import MultiLabelTreeModel
+    from .window_dataset import load_window_payload, split_window_payload
 
 
 def _parse_folds(text: str) -> list[int]:
@@ -33,6 +48,7 @@ def _parse_folds(text: str) -> list[int]:
 
 def _update_cfg_from_args(cfg: EncoderBlockConfig, args) -> EncoderBlockConfig:
     cfg.raw_dataset_file = str(args.raw_dataset_file)
+    cfg.window_dataset_file = str(args.window_dataset_file).strip() if args.window_dataset_file else None
     cfg.step = int(args.step)
     cfg.window_seconds = float(args.window_seconds)
     cfg.sample_rate_hz = int(args.sample_rate_hz)
@@ -125,9 +141,27 @@ def _hstack_nonempty(blocks: list[np.ndarray]) -> np.ndarray:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal encoder + tree model pipeline for CPS HAR.")
-    parser.add_argument("--data_dir", default=None, help="Dataset directory. Default: <repo>/encoderblock/data")
-    parser.add_argument("--raw_dataset_file", default="cps_data_multi_label.pkl")
-    parser.add_argument("--step", type=int, default=500)
+    parser.add_argument(
+        "--data_dir",
+        default=None,
+        help="Primary data directory. Search order: --data_dir, <encoderblock>/data, ../cpsHAR/data (if it exists).",
+    )
+    parser.add_argument(
+        "--raw_dataset_file",
+        default="cps_data_multi_label.pkl",
+        help="Raw CPS dataset file. Used only when a window dataset must be generated automatically.",
+    )
+    parser.add_argument(
+        "--window_dataset_file",
+        default=None,
+        help="Optional pre-windowed dataset file (.pkl). If set, it overrides --step based file lookup.",
+    )
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=500,
+        help="Window stride in raw samples. Used to resolve cps_windows_2s_2000hz_step_<step>.pkl when --window_dataset_file is not set.",
+    )
     parser.add_argument("--window_seconds", type=float, default=2.0)
     parser.add_argument("--sample_rate_hz", type=int, default=2000)
     parser.add_argument("--folds", default="1,2,3,4", help="Comma-separated folds in [1,2,3,4].")
@@ -150,7 +184,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--downsample_method",
         default="interval",
         choices=["interval", "mean_pool", "sliding_window", "sliding_mean"],
-        help="interval=抽点, mean_pool=不重叠均值池化, sliding_window=窗口均值(可设window/step)",
+        help="interval=pick every k-th point, mean_pool=non-overlap average pooling, sliding_window=overlap moving average. sliding_mean is an alias of sliding_window.",
     )
     parser.add_argument("--downsample_window_size", type=int, default=40)
     parser.add_argument("--downsample_window_step", type=int, default=20)
@@ -203,17 +237,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
-    payload = load_window_payload(
+    payload, payload_path = load_window_payload(
         data_dir=cfg.data_dir,
         raw_dataset_file=cfg.raw_dataset_file,
+        window_dataset_file=cfg.window_dataset_file,
         step=cfg.step,
         window_size=cfg.window_size,
     )
+    print(f"resolved_window_data : {payload_path}")
 
     run_summary = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "pipeline": "encoderblock",
         "config": to_jsonable(copy.deepcopy(cfg.__dict__)),
+        "data_loading": {
+            "data_dir": str(cfg.data_dir),
+            "window_dataset_file_arg": cfg.window_dataset_file,
+            "resolved_window_dataset_file": str(payload_path),
+            "payload_kind": payload.get("kind"),
+            "source_dataset_file": payload.get("source_dataset_file"),
+            "step_size": payload.get("step_size"),
+            "window_size": payload.get("window_size"),
+            "sample_frequency": payload.get("sample_frequency"),
+        },
         "folds": [],
         "aggregate": {},
     }
@@ -456,6 +502,8 @@ def main():
 
     print("\n=== EncoderBlock Run Config ===")
     print(f"data_dir             : {cfg.data_dir}")
+    print(f"window_dataset_file  : {cfg.window_dataset_file or '(auto by step)'}")
+    print(f"raw_dataset_file     : {cfg.raw_dataset_file}")
     print(f"step                 : {cfg.step}")
     print(f"window_size          : {cfg.window_size}")
     print(f"folds                : {cfg.folds}")

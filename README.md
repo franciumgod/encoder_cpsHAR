@@ -1,108 +1,173 @@
-# EncoderBlock 最小可运行方案（CPS HAR）
+# EncoderBlock
 
-这个目录用于快速做“手工特征 + Encoder + 树模型”的组合实验，重点支持：
+`encoderblock/` 现在按“可单独搬走的最小目录单元”来组织。
 
-- `step=500` 默认切窗（可改）
-- `special signal` 开关
-- `Acc.norm / Gyro.norm` 合成信号开关
-- 域选择：`time / freq / time_freq`
-- 频域方法：`rfft / welch_psd / stft / dwt`
-- 旋转增强：`xy / xz / yz / xyz`
-- 特征融合：手工特征、Encoder 特征、两者融合
-- 采样视图：原始采样、降采样、两者并用
-- Encoder 轴模式：全轴联合（joint）/ 每轴独立（per_axis）
+也就是说：
 
-## 目录结构
+- 入口就是当前目录下的 `run.py`
+- 默认数据目录就是当前目录下的 `data/`
+- 默认输出目录就是当前目录下的 `output/`
+- 你把整个 `encoderblock/` 文件夹拷走后，优先保证 `python run.py ...` 还能直接工作
 
-- `encoderblock/config.py`：默认配置
-- `encoderblock/data.py`：窗口数据加载与 split
-- `encoderblock/sampling.py`：采样视图与降采样
-- `encoderblock/domain.py`：域特征构建
-- `encoderblock/augment.py`：旋转增强
-- `encoderblock/encoder.py`：Encoder 模块
-- `encoderblock/tree_models.py`：LightGBM / XGBoost 多标签分类
-- `encoderblock/metrics.py`：评估与绘图
-- `encoderblock/run.py`：主入口
-- `run_encoderblock.py`：快捷入口
+## 目录说明
 
-## 数据目录
+- `run.py`
+  主入口。直接运行这个文件即可。
+- `config.py`
+  默认配置。
+- `window_dataset.py`
+  窗口数据加载、自动查找、按 experiment 划分 train / val / test。
+- `data.py`
+  兼容层，保留旧名字；新代码请看 `window_dataset.py`。
+- `sampling.py`
+  构造 `raw / downsampled / both` 三种特征视图。
+- `domain.py`
+  构造时域 / 频域 / 工程特征。
+- `augment.py`
+  旋转增强。
+- `encoder.py`
+  encoder 投影模块。
+- `tree_models.py`
+  LightGBM / XGBoost 多标签模型。
+- `metrics.py`
+  评估与绘图。
+- `data/`
+  默认数据目录。
+- `output/`
+  默认输出目录。
 
-默认数据目录是：
+## 运行方式
 
-- `encoderblock/data`
-
-你也可以通过 `--data_dir` 指定别的目录。
-
-## 快速运行
+在 `encoderblock/` 目录里直接运行：
 
 ```bash
-conda run -n p2s python run_encoderblock.py --model lightgbm --step 500
+python run.py --step 500
 ```
 
-## 常见命令
-
-1) 原始采样 + 手工特征 + MLP Encoder
+如果你是在上一级目录运行，也可以：
 
 ```bash
-conda run -n p2s python run_encoderblock.py \
+python encoderblock/run.py --step 500
+```
+
+## 数据路径规则
+
+现在的查找顺序是：
+
+1. `--data_dir`
+2. 当前目录下的 `data/`
+3. 上一级目录下的 `cpsHAR/data/`，如果这个目录存在
+
+所以在“单独搬走 `encoderblock/`”的场景下，最稳妥的放法就是：
+
+```text
+encoderblock/
+  run.py
+  config.py
+  window_dataset.py
+  ...
+  data/
+    cps_windows_2s_2000hz_step_500.pkl
+```
+
+## `from .data` 到底是什么
+
+以前 `run.py` 里写的：
+
+```python
+from .data import load_window_payload, split_window_payload
+```
+
+这里的 `.data` 指的是 Python 模块 `data.py`，不是 `data/` 文件夹。
+
+现在主逻辑已经改成：
+
+```python
+from .window_dataset import load_window_payload, split_window_payload
+```
+
+这样模块名和数据目录不再混淆。
+
+## 已切割数据怎么用
+
+### 方式 1：直接指定文件
+
+如果你已经有切好的窗口数据，推荐直接写：
+
+```bash
+python run.py --window_dataset_file your_windows.pkl
+```
+
+### 方式 2：按 `step` 自动找约定文件名
+
+如果你的文件名就是：
+
+```text
+cps_windows_2s_2000hz_step_500.pkl
+```
+
+那就可以直接：
+
+```bash
+python run.py --step 500
+```
+
+这里的 `step` 是“选择哪个窗口数据文件”的依据，不是训练时再切一次窗。
+
+## `sliding_mean` 和 `sliding_window`
+
+当前实现里两者没有区别：
+
+- `sliding_mean` 是别名
+- 最终都会归一化成 `sliding_window`
+
+真正有区别的是下面三种降采样：
+
+- `interval`：隔点抽样，不做平均
+- `mean_pool`：不重叠窗口均值
+- `sliding_window`：滑动窗口均值，可以重叠，更平滑
+
+## 常用命令
+
+### 1. 直接使用现成窗口数据
+
+```bash
+python run.py \
+  --window_dataset_file cps_windows_2s_2000hz_step_500.pkl \
   --sampling_feature_mode raw \
-  --feature_fusion_mode hybrid \
-  --encoder_backend mlp \
-  --encoder_output_dim 128
-```
-
-2) 仅降采样视图（100Hz）+ 融合特征
-
-```bash
-conda run -n p2s python run_encoderblock.py \
-  --sampling_feature_mode downsampled \
-  --downsample_target_hz 100 \
-  --downsample_method interval \
   --feature_fusion_mode hybrid
 ```
 
-3) 原始 + 降采样 两路同时用
+### 2. 只使用降采样视图
 
 ```bash
-conda run -n p2s python run_encoderblock.py \
-  --sampling_feature_mode both \
-  --downsample_target_hz 100 \
-  --downsample_method mean_pool \
-  --feature_fusion_mode hybrid
-```
-
-4) 滑动窗口平均降采样（先平滑再抽点）
-
-```bash
-conda run -n p2s python run_encoderblock.py \
+python run.py \
+  --window_dataset_file cps_windows_2s_2000hz_step_500.pkl \
   --sampling_feature_mode downsampled \
   --downsample_target_hz 100 \
+  --downsample_method interval
+```
+
+### 3. 使用滑动窗口均值降采样
+
+```bash
+python run.py \
+  --window_dataset_file cps_windows_2s_2000hz_step_500.pkl \
+  --sampling_feature_mode downsampled \
   --downsample_method sliding_window \
   --downsample_window_size 40 \
-  --downsample_window_step 20 \
-  --feature_fusion_mode hybrid
+  --downsample_window_step 20
 ```
 
 ## 输出
 
-`--output` 目录下会有：
+默认输出到当前目录下的 `output/`。
 
-- 每折混淆矩阵图
-- 每折二分类混淆矩阵图
-- 每折时间线图
-- overall 汇总图
-- `run_summary.json`
+`run_summary.json` 里会记录：
 
-`run_summary.json` 会记录：
+- 这次实际读到的窗口数据文件路径
+- 数据来源文件名
+- payload 类型
+- step 和窗口大小
 
-- 实际采样分支（`raw/downsampled/both`）
-- 每个分支的输入形状、采样率、降采样因子
-- 每个分支的 encoder 实际后端（含回退信息）
-- 每折与汇总指标
-
-## Torch 说明
-
-当前环境如果没有 `torch`：
-
-- `encoder_backend=mlp` 可正常跑
-- `encoder_backend=cnn1d/rescnn1d` 会自动回退到 PCA（会写入 summary）
+这样你能直接确认程序到底读的是哪个 `.pkl`。
