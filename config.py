@@ -77,7 +77,7 @@ class EncoderBlockConfig:
 
     # encoder
     use_encoder: bool = True
-    encoder_backend: str = "mlp"  # mlp | cnn1d | rescnn1d | none
+    encoder_backend: str = "mlp"  # mlp | cnn1d | rescnn1d | tcn | inceptiontime | none
     encoder_axis_mode: str = "joint"  # joint | per_axis
     encoder_output_dim: int = 128
     encoder_hidden_dim: int = 256
@@ -88,6 +88,10 @@ class EncoderBlockConfig:
     encoder_epochs: int = 15
     encoder_batch_size: int = 128
     encoder_lr: float = 1e-3
+    drop_zero_label_before_feature_extraction: bool = False
+    export_encoder_table: bool = False
+    encoder_table_dim: int = 64
+    encoder_table_branch: str = "raw"
 
     # classifier
     model_type: str = "lightgbm"  # lightgbm | xgboost
@@ -107,12 +111,15 @@ class EncoderBlockConfig:
     lgbm_reg_lambda: float = 0.0
 
     xgb_n_estimators: int = 500
+    xgb_early_stopping_rounds: int = 100
+    xgb_device: str = "cuda"
     xgb_learning_rate: float = 0.05
     xgb_max_depth: int = 6
     xgb_subsample: float = 0.9
     xgb_colsample_bytree: float = 0.8
     xgb_reg_alpha: float = 0.0
     xgb_reg_lambda: float = 1.0
+    threshold: float = 0.5
 
     def __post_init__(self) -> None:
         if self.encoder_channels is None:

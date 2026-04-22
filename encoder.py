@@ -257,9 +257,126 @@ if torch is not None:  # pragma: no cover
             return out
 
 
+    class _TCNBlock1D(nn.Module):
+        def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            dilation: int = 1,
+            use_se: bool = False,
+            dropout: float = 0.0,
+        ):
+            super().__init__()
+            pad = ((kernel_size - 1) * dilation) // 2
+            self.conv1 = nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=pad,
+                dilation=dilation,
+                bias=False,
+            )
+            self.bn1 = nn.BatchNorm1d(out_channels)
+            self.conv2 = nn.Conv1d(
+                out_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=pad,
+                dilation=dilation,
+                bias=False,
+            )
+            self.bn2 = nn.BatchNorm1d(out_channels)
+            self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+            self.se = _SEBlock1D(out_channels) if use_se else nn.Identity()
+            self.shortcut = (
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
+                if in_channels != out_channels
+                else nn.Identity()
+            )
+            self.act = nn.ReLU(inplace=True)
+
+        def forward(self, x):
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.act(out)
+            out = self.drop(out)
+            out = self.conv2(out)
+            out = self.bn2(out)
+            out = self.se(out)
+            out = out + self.shortcut(x)
+            out = self.act(out)
+            return out
+
+
+    class _InceptionBlock1D(nn.Module):
+        def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernels: list[int],
+            use_se: bool = False,
+            dropout: float = 0.0,
+        ):
+            super().__init__()
+            k1 = int(kernels[0]) if len(kernels) >= 1 else 3
+            k2 = int(kernels[1]) if len(kernels) >= 2 else k1
+            k1 = max(1, k1 if (k1 % 2 == 1) else k1 + 1)
+            k2 = max(1, k2 if (k2 % 2 == 1) else k2 + 1)
+
+            c_base = max(1, out_channels // 4)
+            c1 = c_base
+            c2 = c_base
+            c3 = c_base
+            c4 = max(1, out_channels - (c1 + c2 + c3))
+            branch_total = c1 + c2 + c3 + c4
+
+            bottleneck = max(1, min(32, in_channels))
+            self.b1 = nn.Conv1d(in_channels, c1, kernel_size=1, bias=False)
+            self.b2 = nn.Sequential(
+                nn.Conv1d(in_channels, bottleneck, kernel_size=1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(bottleneck, c2, kernel_size=k1, padding=k1 // 2, bias=False),
+            )
+            self.b3 = nn.Sequential(
+                nn.Conv1d(in_channels, bottleneck, kernel_size=1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(bottleneck, c3, kernel_size=k2, padding=k2 // 2, bias=False),
+            )
+            self.b4 = nn.Sequential(
+                nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
+                nn.Conv1d(in_channels, c4, kernel_size=1, bias=False),
+            )
+            self.proj_out = (
+                nn.Conv1d(branch_total, out_channels, kernel_size=1, bias=False)
+                if branch_total != out_channels
+                else nn.Identity()
+            )
+            self.bn = nn.BatchNorm1d(out_channels)
+            self.se = _SEBlock1D(out_channels) if use_se else nn.Identity()
+            self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+            self.shortcut = (
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
+                if in_channels != out_channels
+                else nn.Identity()
+            )
+            self.act = nn.ReLU(inplace=True)
+
+        def forward(self, x):
+            out = torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
+            out = self.proj_out(out)
+            out = self.bn(out)
+            out = self.se(out)
+            out = self.drop(out)
+            out = out + self.shortcut(x)
+            out = self.act(out)
+            return out
+
+
     class _ConvAutoEncoder(nn.Module):
         def __init__(
             self,
+            backbone: str,
             in_channels: int,
             time_steps: int,
             latent_dim: int,
@@ -273,18 +390,53 @@ if torch is not None:  # pragma: no cover
             super().__init__()
             layers = []
             c_in = in_channels
+            self.backbone = str(backbone).strip().lower()
             for i, c_out in enumerate(channels):
                 k = kernels[min(i, len(kernels) - 1)]
-                pad = k // 2
-                layers.extend(
-                    [
-                        nn.Conv1d(c_in, c_out, kernel_size=k, padding=pad, bias=False),
-                        nn.BatchNorm1d(c_out),
-                        nn.ReLU(inplace=True),
-                    ]
-                )
-                if use_residual:
-                    layers.append(_ResBlock1D(c_out, kernel_size=k, use_se=use_se, dropout=dropout))
+                if self.backbone == "cnn1d":
+                    pad = k // 2
+                    layers.extend(
+                        [
+                            nn.Conv1d(c_in, c_out, kernel_size=k, padding=pad, bias=False),
+                            nn.BatchNorm1d(c_out),
+                            nn.ReLU(inplace=True),
+                            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                        ]
+                    )
+                elif self.backbone == "rescnn1d":
+                    pad = k // 2
+                    layers.extend(
+                        [
+                            nn.Conv1d(c_in, c_out, kernel_size=k, padding=pad, bias=False),
+                            nn.BatchNorm1d(c_out),
+                            nn.ReLU(inplace=True),
+                            _ResBlock1D(c_out, kernel_size=k, use_se=use_se, dropout=dropout),
+                        ]
+                    )
+                elif self.backbone == "tcn":
+                    dilation = 2 ** i
+                    layers.append(
+                        _TCNBlock1D(
+                            in_channels=c_in,
+                            out_channels=c_out,
+                            kernel_size=k,
+                            dilation=dilation,
+                            use_se=use_se,
+                            dropout=dropout,
+                        )
+                    )
+                elif self.backbone == "inceptiontime":
+                    layers.append(
+                        _InceptionBlock1D(
+                            in_channels=c_in,
+                            out_channels=c_out,
+                            kernels=kernels,
+                            use_se=use_se,
+                            dropout=dropout,
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unsupported torch encoder backbone: {self.backbone}")
                 c_in = c_out
 
             self.feature = nn.Sequential(*layers) if layers else nn.Identity()
@@ -426,19 +578,19 @@ if torch is not None:  # pragma: no cover
             X_norm = self._normalize(X_arr)
 
             n, t, c = X_norm.shape
-            use_res = self.backend == "rescnn1d"
             if self.axis_mode == "per_axis":
                 axis_dim = max(1, self.latent_dim // max(1, c))
                 self.axis_models = []
                 for ch in range(c):
                     model = _ConvAutoEncoder(
+                        backbone=self.backend,
                         in_channels=1,
                         time_steps=t,
                         latent_dim=axis_dim,
                         hidden_dim=self.hidden_dim,
                         channels=self.channels,
                         kernels=self.kernels,
-                        use_residual=use_res,
+                        use_residual=False,
                         use_se=self.use_se,
                         dropout=self.dropout,
                     ).to(self.device)
@@ -448,13 +600,14 @@ if torch is not None:  # pragma: no cover
                 return self
 
             self.model = _ConvAutoEncoder(
+                backbone=self.backend,
                 in_channels=c,
                 time_steps=t,
                 latent_dim=self.latent_dim,
                 hidden_dim=self.hidden_dim,
                 channels=self.channels,
                 kernels=self.kernels,
-                use_residual=use_res,
+                use_residual=False,
                 use_se=self.use_se,
                 dropout=self.dropout,
             ).to(self.device)
@@ -490,7 +643,7 @@ class EncoderProjector:
     Unified encoder interface.
     - none: no encoder features
     - mlp: sklearn MLP autoencoder bottleneck
-    - cnn1d/rescnn1d: torch autoencoder when torch available, otherwise fallback to PCA
+    - cnn1d/rescnn1d/tcn/inceptiontime: torch autoencoder when torch available, otherwise fallback to PCA
     """
 
     def __init__(self, cfg):
@@ -536,7 +689,7 @@ class EncoderProjector:
             self.meta.effective_backend = "mlp"
             return
 
-        if self.backend in {"cnn1d", "rescnn1d"}:
+        if self.backend in {"cnn1d", "rescnn1d", "tcn", "inceptiontime"}:
             if torch is not None:
                 self.impl = _TorchConvEncoder(
                     backend=self.backend,
@@ -561,7 +714,7 @@ class EncoderProjector:
             else:
                 self.impl = _PCAEncoder(latent_dim=latent_dim, random_seed=seed)
                 self.meta.effective_backend = "pca_fallback"
-            self.meta.note = "Torch unavailable. Requested CNN encoder fallback to PCA."
+            self.meta.note = f"Torch unavailable. Requested '{self.backend}' encoder fallback to PCA."
             return
 
         self.impl = _PCAEncoder(latent_dim=latent_dim, random_seed=seed)

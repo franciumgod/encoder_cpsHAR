@@ -1,19 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
 try:
-    from lightgbm import LGBMClassifier
+    import xgboost as xgb
 except Exception:  # pragma: no cover
-    LGBMClassifier = None
-
-try:
-    from xgboost import XGBClassifier
-except Exception:  # pragma: no cover
-    XGBClassifier = None
+    xgb = None
 
 
 class _ConstantBinaryEstimator:
@@ -26,11 +21,7 @@ class _ConstantBinaryEstimator:
     def predict_proba(self, X):
         n = len(X)
         pos = np.full((n,), float(self.constant), dtype=np.float32)
-        neg = 1.0 - pos
-        return np.column_stack([neg, pos]).astype(np.float32, copy=False)
-
-    def predict(self, X):
-        return np.full((len(X),), self.constant, dtype=np.int8)
+        return pos
 
 
 @dataclass
@@ -41,87 +32,88 @@ class ModelMeta:
 
 
 class MultiLabelTreeModel:
+    """
+    Multi-label OvR model with native XGBoost API (xgb.train + DMatrix).
+    """
+
     def __init__(self, cfg, label_cols: List[str]):
         self.cfg = cfg
         self.label_cols = list(label_cols)
-        self.model_type = str(getattr(cfg, "model_type", "lightgbm")).strip().lower()
         self.estimators: List[object] = []
-        self.meta = ModelMeta(model_type=self.model_type, n_classes=len(self.label_cols), fitted=False)
-
-    def _build_lgbm(self):
-        if LGBMClassifier is None:
-            raise RuntimeError("lightgbm is not available in the current environment.")
-        return LGBMClassifier(
-            n_estimators=int(getattr(self.cfg, "lgbm_n_estimators", 500)),
-            learning_rate=float(getattr(self.cfg, "lgbm_learning_rate", 0.05)),
-            num_leaves=int(getattr(self.cfg, "lgbm_num_leaves", 63)),
-            max_depth=int(getattr(self.cfg, "lgbm_max_depth", 6)),
-            subsample=float(getattr(self.cfg, "lgbm_subsample", 0.9)),
-            colsample_bytree=float(getattr(self.cfg, "lgbm_colsample_bytree", 0.8)),
-            min_child_samples=int(getattr(self.cfg, "lgbm_min_child_samples", 20)),
-            reg_alpha=float(getattr(self.cfg, "lgbm_reg_alpha", 0.0)),
-            reg_lambda=float(getattr(self.cfg, "lgbm_reg_lambda", 0.0)),
-            class_weight="balanced",
-            random_state=int(getattr(self.cfg, "random_seed", 42)),
-            n_jobs=-1,
-            verbose=-1,
-        )
-
-    def _build_xgb(self):
-        if XGBClassifier is None:
+        self.best_iterations: List[int] = []
+        self.meta = ModelMeta(model_type="xgboost_native", n_classes=len(self.label_cols), fitted=False)
+        if xgb is None:
             raise RuntimeError("xgboost is not available in the current environment.")
-        return XGBClassifier(
-            n_estimators=int(getattr(self.cfg, "xgb_n_estimators", 500)),
-            learning_rate=float(getattr(self.cfg, "xgb_learning_rate", 0.05)),
-            max_depth=int(getattr(self.cfg, "xgb_max_depth", 6)),
-            subsample=float(getattr(self.cfg, "xgb_subsample", 0.9)),
-            colsample_bytree=float(getattr(self.cfg, "xgb_colsample_bytree", 0.8)),
-            reg_alpha=float(getattr(self.cfg, "xgb_reg_alpha", 0.0)),
-            reg_lambda=float(getattr(self.cfg, "xgb_reg_lambda", 1.0)),
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=int(getattr(self.cfg, "random_seed", 42)),
-            n_jobs=-1,
-            tree_method="hist",
-            verbosity=0,
-        )
 
-    def _build_estimator(self):
-        if self.model_type == "xgboost":
-            return self._build_xgb()
-        return self._build_lgbm()
+    def _xgb_params(self) -> dict:
+        device = str(getattr(self.cfg, "xgb_device", "cuda")).strip().lower()
+        return {
+            "objective": "binary:logistic",
+            "tree_method": "hist",
+            "device": device,
+            "eta": float(getattr(self.cfg, "xgb_learning_rate", 0.05)),
+            "max_depth": int(getattr(self.cfg, "xgb_max_depth", 6)),
+            "subsample": float(getattr(self.cfg, "xgb_subsample", 0.8)),
+            "colsample_bytree": float(getattr(self.cfg, "xgb_colsample_bytree", 0.8)),
+            "reg_alpha": float(getattr(self.cfg, "xgb_reg_alpha", 0.0)),
+            "reg_lambda": float(getattr(self.cfg, "xgb_reg_lambda", 1.0)),
+            "eval_metric": "logloss",
+            "seed": int(getattr(self.cfg, "random_seed", 42)),
+            "verbosity": 0,
+        }
 
     def fit(
         self,
         X_train: np.ndarray,
         y_train: np.ndarray,
-        X_val: Optional[np.ndarray] = None,
-        y_val: Optional[np.ndarray] = None,
-        train_with_val: bool = True,
+        X_val: np.ndarray | None = None,
+        y_val: np.ndarray | None = None,
+        train_with_val: bool = False,
     ) -> "MultiLabelTreeModel":
         X_tr = np.asarray(X_train, dtype=np.float32)
         y_tr = np.asarray(y_train, dtype=np.int8)
 
-        if train_with_val and X_val is not None and y_val is not None and len(X_val) > 0:
-            X_fit = np.concatenate([X_tr, np.asarray(X_val, dtype=np.float32)], axis=0)
-            y_fit = np.concatenate([y_tr, np.asarray(y_val, dtype=np.int8)], axis=0)
-        else:
-            X_fit = X_tr
-            y_fit = y_tr
+        X_va = np.asarray(X_val, dtype=np.float32) if X_val is not None else None
+        y_va = np.asarray(y_val, dtype=np.int8) if y_val is not None else None
+
+        params = self._xgb_params()
+        num_boost_round = int(getattr(self.cfg, "xgb_n_estimators", 2000))
+        early_stopping_rounds = int(getattr(self.cfg, "xgb_early_stopping_rounds", 100))
 
         self.estimators = []
-        for cls_idx in range(y_fit.shape[1]):
-            y_cls = y_fit[:, cls_idx]
-            unique = np.unique(y_cls)
-            if unique.size < 2:
-                est = _ConstantBinaryEstimator(constant=int(unique[0]))
-                est.fit(X_fit, y_cls)
-                self.estimators.append(est)
+        self.best_iterations = []
+
+        for cls_idx in range(y_tr.shape[1]):
+            y_cls = y_tr[:, cls_idx]
+            uniq = np.unique(y_cls)
+            if uniq.size < 2:
+                const_model = _ConstantBinaryEstimator(constant=int(uniq[0]))
+                const_model.fit(X_tr, y_cls)
+                self.estimators.append(const_model)
+                self.best_iterations.append(0)
                 continue
 
-            est = self._build_estimator()
-            est.fit(X_fit, y_cls)
-            self.estimators.append(est)
+            dtrain = xgb.DMatrix(X_tr, label=y_cls)
+
+            if X_va is not None and y_va is not None and len(X_va) > 0 and not train_with_val:
+                dval = xgb.DMatrix(X_va, label=y_va[:, cls_idx])
+                evals = [(dtrain, "train"), (dval, "valid")]
+            else:
+                evals = [(dtrain, "train")]
+
+            booster = xgb.train(
+                params=params,
+                dtrain=dtrain,
+                num_boost_round=num_boost_round,
+                evals=evals,
+                early_stopping_rounds=early_stopping_rounds if len(evals) > 1 else None,
+                verbose_eval=False,
+            )
+            best_it = int(getattr(booster, "best_iteration", num_boost_round - 1))
+            if best_it < 0:
+                best_it = num_boost_round - 1
+            self.estimators.append(booster)
+            self.best_iterations.append(best_it)
 
         self.meta.fitted = True
         return self
@@ -130,15 +122,16 @@ class MultiLabelTreeModel:
         if not self.meta.fitted:
             raise RuntimeError("Model is not fitted.")
         X_arr = np.asarray(X, dtype=np.float32)
-        cols = []
-        for est in self.estimators:
-            prob = est.predict_proba(X_arr)
-            prob = np.asarray(prob)
-            if prob.ndim == 2 and prob.shape[1] >= 2:
-                cols.append(prob[:, 1].astype(np.float32, copy=False))
+        dtest = xgb.DMatrix(X_arr)
+        probs = []
+
+        for est, best_it in zip(self.estimators, self.best_iterations):
+            if isinstance(est, _ConstantBinaryEstimator):
+                p = est.predict_proba(X_arr)
             else:
-                cols.append(prob.reshape(-1).astype(np.float32, copy=False))
-        return np.column_stack(cols).astype(np.float32, copy=False)
+                p = est.predict(dtest, iteration_range=(0, int(best_it) + 1))
+            probs.append(np.asarray(p, dtype=np.float32).reshape(-1))
+        return np.column_stack(probs).astype(np.float32, copy=False)
 
     def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         prob = self.predict_proba(X)
