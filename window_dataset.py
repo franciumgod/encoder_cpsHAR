@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -63,6 +64,16 @@ def canonical_window_dataset_file(step: int) -> str:
     return f"cps_windows_2s_2000hz_step_{int(step)}.pkl"
 
 
+WINDOW_DATASET_RE = re.compile(r"^cps_windows_2s_2000hz_step_(\d+)\.pkl$", re.IGNORECASE)
+
+
+def _parse_step_from_window_file(path: Path) -> int | None:
+    match = WINDOW_DATASET_RE.match(path.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def _unique_paths(paths: List[Path]) -> List[Path]:
     out: List[Path] = []
     seen = set()
@@ -84,6 +95,27 @@ def get_data_search_dirs(data_dir: Path | None) -> List[Path]:
     if LEGACY_DATA_DIR.exists():
         candidates.append(LEGACY_DATA_DIR)
     return _unique_paths(candidates)
+
+
+def _get_primary_data_dirs(data_dir: Path | None) -> List[Path]:
+    candidates: List[Path] = []
+    if data_dir is not None:
+        candidates.append(Path(data_dir))
+    candidates.append(DEFAULT_WINDOW_DATA_DIR)
+    return _unique_paths(candidates)
+
+
+def _discover_window_dataset_files(data_dir: Path | None, include_legacy: bool = True) -> List[Path]:
+    paths: List[Path] = []
+    search_dirs = get_data_search_dirs(data_dir) if include_legacy else _get_primary_data_dirs(data_dir)
+    for base in search_dirs:
+        if not base.exists() or not base.is_dir():
+            continue
+        for candidate in base.glob("cps_windows_2s_2000hz_step_*.pkl"):
+            if _parse_step_from_window_file(candidate) is None:
+                continue
+            paths.append(candidate)
+    return _unique_paths(paths)
 
 
 def _resolve_existing_data_file(file_name_or_path: str | Path | None, data_dir: Path | None) -> Path | None:
@@ -254,12 +286,31 @@ def ensure_window_dataset(
     window_size: int,
     window_dataset_file: str | None = None,
 ) -> Path:
-    resolved_window_path = _resolve_existing_data_file(
-        window_dataset_file or canonical_window_dataset_file(step),
-        data_dir=data_dir,
-    )
-    if resolved_window_path is not None:
-        return resolved_window_path
+    canonical_name = canonical_window_dataset_file(step)
+
+    if window_dataset_file:
+        resolved_window_path = _resolve_existing_data_file(window_dataset_file, data_dir=data_dir)
+        if resolved_window_path is not None:
+            return resolved_window_path
+    else:
+        # Prefer explicitly provided/local data dirs before falling back to legacy dirs.
+        primary_windows = _discover_window_dataset_files(data_dir=data_dir, include_legacy=False)
+        primary_exact = [p for p in primary_windows if p.name.lower() == canonical_name.lower()]
+        if primary_exact:
+            return primary_exact[0]
+        if len(primary_windows) == 1:
+            only_path = primary_windows[0]
+            detected_step = _parse_step_from_window_file(only_path)
+            if detected_step is not None and int(detected_step) != int(step):
+                print(
+                    f"[window_dataset] Requested step={int(step)} not found; "
+                    f"auto-using existing dataset {only_path.name} (step={detected_step})."
+                )
+            return only_path
+
+        resolved_window_path = _resolve_existing_data_file(canonical_name, data_dir=data_dir)
+        if resolved_window_path is not None:
+            return resolved_window_path
 
     if window_dataset_file:
         search_text = ", ".join(str(p) for p in get_data_search_dirs(data_dir))
@@ -268,9 +319,27 @@ def ensure_window_dataset(
             f"Searched current path and data dirs: {search_text}"
         )
 
+    discovered_windows = _discover_window_dataset_files(data_dir=data_dir, include_legacy=True)
+    if len(discovered_windows) == 1:
+        only_path = discovered_windows[0]
+        detected_step = _parse_step_from_window_file(only_path)
+        if detected_step is not None and int(detected_step) != int(step):
+            print(
+                f"[window_dataset] Requested step={int(step)} not found; "
+                f"auto-using existing dataset {only_path.name} (step={detected_step})."
+            )
+        return only_path
+
     raw_path = _resolve_existing_data_file(raw_dataset_file, data_dir=data_dir)
     if raw_path is None:
         search_text = ", ".join(str(p) for p in get_data_search_dirs(data_dir))
+        if discovered_windows:
+            found_text = ", ".join(str(p) for p in discovered_windows)
+            raise FileNotFoundError(
+                f"Requested step={int(step)} dataset was not found, and raw dataset was not found: {raw_dataset_file}. "
+                f"Found existing window datasets: {found_text}. "
+                f"Searched current path and data dirs: {search_text}"
+            )
         raise FileNotFoundError(
             f"Raw dataset not found: {raw_dataset_file}. "
             f"Searched current path and data dirs: {search_text}"

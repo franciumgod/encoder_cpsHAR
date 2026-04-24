@@ -68,10 +68,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="EncoderBlock fixed 3-scale pipeline (2000/raw + 500/sw40-4 + 100/sw40-20) with native XGBoost."
     )
-    parser.add_argument("--data_dir", default=None)
+    parser.add_argument("--data_dir", default="data/cps_window_2s_2000hz_step_250.pkl")
     parser.add_argument("--raw_dataset_file", default="cps_data_multi_label.pkl")
     parser.add_argument("--window_dataset_file", default=None)
-    parser.add_argument("--step", type=int, default=500)
+    parser.add_argument("--step", type=int, default=250)
     parser.add_argument("--window_seconds", type=float, default=2.0)
     parser.add_argument("--sample_rate_hz", type=int, default=2000)
     parser.add_argument("--folds", default="1,2,3,4")
@@ -258,7 +258,10 @@ def _build_fixed_three_scales(X: np.ndarray, source_hz: int) -> Dict[str, dict]:
 
 
 def _filter_zero_label_samples(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-    y_arr = np.asarray(y, dtype=np.int8)
+    y_arr = np.asarray(y)
+    if y_arr.ndim != 2:
+        raise ValueError(f"Expected y with shape (n_samples, n_labels), got shape={y_arr.shape}")
+    y_arr = (y_arr > 0).astype(np.int8, copy=False)
     mask = np.sum(y_arr, axis=1) > 0
     dropped = int(np.sum(~mask))
     return np.asarray(X, dtype=np.float32)[mask], y_arr[mask], dropped
@@ -304,7 +307,20 @@ def _build_table_df(X_feat: np.ndarray, y: np.ndarray, label_cols: List[str], pr
     return pd.concat([feat_df, label_df], axis=1)
 
 
+def _safe_int(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
+    requested_step = int(cfg.step)
+    requested_sample_rate_hz = int(cfg.sample_rate_hz)
     payload, payload_path = load_window_payload(
         data_dir=cfg.data_dir,
         raw_dataset_file=cfg.raw_dataset_file,
@@ -313,6 +329,19 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
         window_size=cfg.window_size,
     )
     print(f"resolved_window_data : {payload_path}")
+
+    payload_step = _safe_int(payload.get("step_size"))
+    if payload_step is not None and payload_step != int(cfg.step):
+        print(f"[warn] requested step={cfg.step}, but payload step_size={payload_step}; using payload step_size.")
+        cfg.step = int(payload_step)
+
+    payload_sample_hz = _safe_int(payload.get("sample_frequency"))
+    if payload_sample_hz is not None and payload_sample_hz > 0 and payload_sample_hz != int(cfg.sample_rate_hz):
+        print(
+            f"[warn] requested sample_rate_hz={cfg.sample_rate_hz}, "
+            f"but payload sample_frequency={payload_sample_hz}; using payload sample_frequency."
+        )
+        cfg.sample_rate_hz = int(payload_sample_hz)
 
     run_summary = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -323,7 +352,11 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             "resolved_window_dataset_file": str(payload_path),
             "payload_kind": payload.get("kind"),
             "source_dataset_file": payload.get("source_dataset_file"),
+            "requested_step": int(requested_step),
+            "effective_step": int(cfg.step),
             "step_size": payload.get("step_size"),
+            "requested_sample_rate_hz": int(requested_sample_rate_hz),
+            "effective_sample_rate_hz": int(cfg.sample_rate_hz),
             "window_size": payload.get("window_size"),
             "sample_frequency": payload.get("sample_frequency"),
         },
@@ -345,9 +378,12 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             use_synth_signals=True,
         )
 
-        X_train, y_train = _ensure_nine_axis_windows(split.X_train, split.sensor_cols)
-        X_val, y_val = _ensure_nine_axis_windows(split.X_val, split.sensor_cols)
-        X_test, y_test = _ensure_nine_axis_windows(split.X_test, split.sensor_cols)
+        X_train, _ = _ensure_nine_axis_windows(split.X_train, split.sensor_cols)
+        X_val, _ = _ensure_nine_axis_windows(split.X_val, split.sensor_cols)
+        X_test, _ = _ensure_nine_axis_windows(split.X_test, split.sensor_cols)
+        y_train = (np.asarray(split.y_train) > 0).astype(np.int8, copy=False)
+        y_val = (np.asarray(split.y_val) > 0).astype(np.int8, copy=False)
+        y_test = (np.asarray(split.y_test) > 0).astype(np.int8, copy=False)
 
         zero_label_drop_stats = {"train": 0, "val": 0, "test": 0}
         if cfg.drop_zero_label_before_feature_extraction:

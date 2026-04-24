@@ -44,7 +44,7 @@ class EncoderBlockConfig:
     # dataset
     raw_dataset_file: str = "cps_data_multi_label.pkl"
     window_dataset_file: Optional[str] = None
-    step: int = 500
+    step: int = 250
     window_seconds: float = 2.0
     sample_rate_hz: int = 2000
     test_experiment_id: int = 1
