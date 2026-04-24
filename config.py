@@ -59,6 +59,7 @@ class EncoderBlockConfig:
     spectrum_method: str = "welch_psd"  # rfft | welch_psd | stft | dwt
     use_feature_engineering: bool = True
     include_handcrafted_features: bool = True
+    handcrafted_feature_injection: str = "outside"  # inside | outside | both
     feature_fusion_mode: str = "auto"  # auto | handcrafted_only | encoder_only | hybrid
 
     # sampling views for feature extraction

@@ -53,6 +53,8 @@ SCALE_SPECS = [
     {"name": "sw100", "hz": 100, "method": "sliding_window", "window": 40, "step": 20},
 ]
 
+HANDCRAFTED_INJECTION_CHOICES = ("inside", "outside", "both")
+
 
 def _parse_folds(text: str) -> list[int]:
     vals = [int(x) for x in parse_csv_ints(text, default=[1, 2, 3, 4])]
@@ -64,11 +66,18 @@ def _parse_folds(text: str) -> list[int]:
     return out or [1, 2, 3, 4]
 
 
+def _normalize_handcrafted_feature_injection(value: str) -> str:
+    text = str(value).strip().lower()
+    if text in HANDCRAFTED_INJECTION_CHOICES:
+        return text
+    return "outside"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="EncoderBlock fixed 3-scale pipeline (2000/raw + 500/sw40-4 + 100/sw40-20) with native XGBoost."
     )
-    parser.add_argument("--data_dir", default="data/cps_window_2s_2000hz_step_250.pkl")
+    parser.add_argument("--data_dir", default=None)
     parser.add_argument("--raw_dataset_file", default="cps_data_multi_label.pkl")
     parser.add_argument("--window_dataset_file", default=None)
     parser.add_argument("--step", type=int, default=250)
@@ -95,6 +104,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder_lr", type=float, default=1e-3)
 
     parser.add_argument("--include_handcrafted_features", default=False)
+    parser.add_argument(
+        "--handcrafted_feature_injection",
+        default="outside",
+        choices=list(HANDCRAFTED_INJECTION_CHOICES),
+    )
     parser.add_argument("--drop_zero_label_before_feature_extraction", default=False)
     parser.add_argument("--export_encoder_table", default=True)
     parser.add_argument("--encoder_table_dim", type=int, default=64)
@@ -130,7 +144,11 @@ def _update_cfg_from_args(cfg: EncoderBlockConfig, args) -> EncoderBlockConfig:
     cfg.spectrum_method = "welch_psd"
     cfg.use_feature_engineering = True
     cfg.include_handcrafted_features = parse_bool(args.include_handcrafted_features, default=False)
-    cfg.feature_fusion_mode = "hybrid" if cfg.include_handcrafted_features else "encoder_only"
+    cfg.handcrafted_feature_injection = _normalize_handcrafted_feature_injection(args.handcrafted_feature_injection)
+    if cfg.include_handcrafted_features and cfg.handcrafted_feature_injection in {"outside", "both"}:
+        cfg.feature_fusion_mode = "hybrid"
+    else:
+        cfg.feature_fusion_mode = "encoder_only"
 
     cfg.use_rotation_augment = False
     cfg.augment_count = 0
@@ -318,6 +336,24 @@ def _safe_int(value) -> int | None:
         return None
 
 
+def _inject_handcrafted_into_encoder_tensor(encoder_tensor: np.ndarray, handcrafted: np.ndarray) -> np.ndarray:
+    enc = np.asarray(encoder_tensor, dtype=np.float32)
+    hand = np.asarray(handcrafted, dtype=np.float32)
+    if hand.size == 0:
+        return enc
+    if enc.shape[0] != hand.shape[0]:
+        raise ValueError(
+            f"Encoder tensor and handcrafted feature rows mismatch: "
+            f"encoder={enc.shape[0]} vs handcrafted={hand.shape[0]}"
+        )
+    if enc.ndim == 3:
+        repeated = np.repeat(hand[:, None, :], enc.shape[1], axis=1).astype(np.float32, copy=False)
+        return np.concatenate([enc, repeated], axis=2).astype(np.float32, copy=False)
+    if enc.ndim == 2:
+        return np.hstack([enc, hand]).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported encoder tensor ndim={enc.ndim}, expected 2D or 3D.")
+
+
 def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
     requested_step = int(cfg.step)
     requested_sample_rate_hz = int(cfg.sample_rate_hz)
@@ -343,6 +379,14 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
         )
         cfg.sample_rate_hz = int(payload_sample_hz)
 
+    handcrafted_mode = _normalize_handcrafted_feature_injection(
+        str(getattr(cfg, "handcrafted_feature_injection", "outside"))
+    )
+    cfg.handcrafted_feature_injection = handcrafted_mode
+    use_handcrafted_any = bool(cfg.include_handcrafted_features)
+    use_handcrafted_for_encoder = use_handcrafted_any and handcrafted_mode in {"inside", "both"}
+    use_handcrafted_for_tree = use_handcrafted_any and handcrafted_mode in {"outside", "both"}
+
     run_summary = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "pipeline": "encoderblock_fixed_multiscale",
@@ -359,6 +403,12 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             "effective_sample_rate_hz": int(cfg.sample_rate_hz),
             "window_size": payload.get("window_size"),
             "sample_frequency": payload.get("sample_frequency"),
+        },
+        "handcrafted_feature_usage": {
+            "enabled": bool(use_handcrafted_any),
+            "mode": handcrafted_mode,
+            "to_encoder": bool(use_handcrafted_for_encoder),
+            "to_tree_model": bool(use_handcrafted_for_tree),
         },
         "folds": [],
         "aggregate": {},
@@ -418,22 +468,27 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
                 feature_domain="time_freq",
                 spectrum_method=cfg.spectrum_method,
                 use_feature_engineering=True,
-                include_handcrafted_features=cfg.include_handcrafted_features,
+                include_handcrafted_features=use_handcrafted_any,
             )
             va_hand, va_enc_tensor = build_feature_matrices(
                 va_info["X"],
                 feature_domain="time_freq",
                 spectrum_method=cfg.spectrum_method,
                 use_feature_engineering=True,
-                include_handcrafted_features=cfg.include_handcrafted_features,
+                include_handcrafted_features=use_handcrafted_any,
             )
             te_hand, te_enc_tensor = build_feature_matrices(
                 te_info["X"],
                 feature_domain="time_freq",
                 spectrum_method=cfg.spectrum_method,
                 use_feature_engineering=True,
-                include_handcrafted_features=cfg.include_handcrafted_features,
+                include_handcrafted_features=use_handcrafted_any,
             )
+
+            if use_handcrafted_for_encoder:
+                tr_enc_tensor = _inject_handcrafted_into_encoder_tensor(tr_enc_tensor, tr_hand)
+                va_enc_tensor = _inject_handcrafted_into_encoder_tensor(va_enc_tensor, va_hand)
+                te_enc_tensor = _inject_handcrafted_into_encoder_tensor(te_enc_tensor, te_hand)
 
             projector = EncoderProjector(cfg)
             tr_enc = projector.fit_transform(tr_enc_tensor)
@@ -444,7 +499,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             val_enc_blocks.append(np.asarray(va_enc, dtype=np.float32))
             test_enc_blocks.append(np.asarray(te_enc, dtype=np.float32))
 
-            if cfg.include_handcrafted_features:
+            if use_handcrafted_for_tree:
                 train_hand_blocks.append(np.asarray(tr_hand, dtype=np.float32))
                 val_hand_blocks.append(np.asarray(va_hand, dtype=np.float32))
                 test_hand_blocks.append(np.asarray(te_hand, dtype=np.float32))
@@ -461,6 +516,11 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
                         "train": list(np.asarray(tr_enc).shape),
                         "val": list(np.asarray(va_enc).shape),
                         "test": list(np.asarray(te_enc).shape),
+                    },
+                    "encoder_input_shape": {
+                        "train": list(np.asarray(tr_enc_tensor).shape),
+                        "val": list(np.asarray(va_enc_tensor).shape),
+                        "test": list(np.asarray(te_enc_tensor).shape),
                     },
                     "handcrafted_shape": {
                         "train": list(np.asarray(tr_hand).shape),
@@ -480,7 +540,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             enc_train_concat, enc_val_concat, enc_test_concat, target_dim=cfg.encoder_table_dim, seed=cfg.random_seed
         )
 
-        if cfg.include_handcrafted_features and train_hand_blocks:
+        if use_handcrafted_for_tree and train_hand_blocks:
             hand_train_concat = np.hstack(train_hand_blocks).astype(np.float32, copy=False)
             hand_val_concat = np.hstack(val_hand_blocks).astype(np.float32, copy=False)
             hand_test_concat = np.hstack(test_hand_blocks).astype(np.float32, copy=False)
@@ -581,6 +641,9 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             "drop_zero_label_before_feature_extraction": bool(cfg.drop_zero_label_before_feature_extraction),
             "zero_label_drop_stats": zero_label_drop_stats,
             "include_handcrafted_features": bool(cfg.include_handcrafted_features),
+            "handcrafted_feature_injection_mode": handcrafted_mode,
+            "handcrafted_used_for_encoder": bool(use_handcrafted_for_encoder),
+            "handcrafted_used_for_tree_model": bool(use_handcrafted_for_tree),
             "encoder_table_dim": int(cfg.encoder_table_dim),
             "feature_shape": {
                 "encoder_concat_train": list(enc_train_concat.shape),
@@ -646,6 +709,7 @@ def main():
     print(f"encoder_output_dim   : {cfg.encoder_output_dim}")
     print(f"encoder_table_dim    : {cfg.encoder_table_dim}")
     print(f"include_handcrafted  : {cfg.include_handcrafted_features}")
+    print(f"handcrafted_mode     : {cfg.handcrafted_feature_injection}")
     print(f"drop_zero_label      : {cfg.drop_zero_label_before_feature_extraction}")
     print(f"export_encoder_table : {cfg.export_encoder_table}")
     print(f"xgb_device           : {cfg.xgb_device}")

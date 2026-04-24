@@ -128,12 +128,18 @@ def extract_time_features(X: np.ndarray, use_feature_engineering: bool = True) -
         rms = np.sqrt(np.mean(X * X, axis=1, dtype=np.float32))
         centered = X - mean[:, None, :]
         rmse = np.sqrt(np.mean(centered * centered, axis=1, dtype=np.float32))
+        std_safe = np.maximum(std, 1e-6).astype(np.float32, copy=False)
+        normalized = centered / std_safe[:, None, :]
+        skewness = np.mean(normalized ** 3, axis=1, dtype=np.float32)
+        kurtosis = np.mean(normalized ** 4, axis=1, dtype=np.float32) - np.float32(3.0)
 
         if X.shape[1] > 1:
             diff_1 = np.diff(X, n=1, axis=1)
             diff_1_mean = np.mean(diff_1, axis=1, dtype=np.float32)
+            zero_crossing_rate = np.mean((X[:, 1:, :] * X[:, :-1, :]) < 0, axis=1, dtype=np.float32)
         else:
             diff_1_mean = np.zeros_like(mean, dtype=np.float32)
+            zero_crossing_rate = np.zeros_like(mean, dtype=np.float32)
 
         lag_blocks = []
         last_idx = X.shape[1] - 1
@@ -141,7 +147,7 @@ def extract_time_features(X: np.ndarray, use_feature_engineering: bool = True) -
             lag_idx = max(0, last_idx - lag)
             lag_blocks.append(X[:, lag_idx, :])
 
-        feat_blocks.extend([rms, rmse, diff_1_mean] + lag_blocks)
+        feat_blocks.extend([rms, rmse, diff_1_mean, skewness, kurtosis, zero_crossing_rate] + lag_blocks)
     return np.hstack(feat_blocks).astype(np.float32, copy=False)
 
 
@@ -232,4 +238,3 @@ def build_feature_matrices(
         spectrum_method=spectrum_method,
     )
     return handcrafted, encoder_tensor
-
