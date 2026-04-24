@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import List
 
@@ -62,6 +63,10 @@ class MultiLabelTreeModel:
             "verbosity": 0,
         }
 
+    @staticmethod
+    def _release_host_memory() -> None:
+        gc.collect()
+
     def fit(
         self,
         X_train: np.ndarray,
@@ -91,9 +96,12 @@ class MultiLabelTreeModel:
                 const_model.fit(X_tr, y_cls)
                 self.estimators.append(const_model)
                 self.best_iterations.append(0)
+                del y_cls, uniq
+                self._release_host_memory()
                 continue
 
             dtrain = xgb.DMatrix(X_tr, label=y_cls)
+            dval = None
 
             if X_va is not None and y_va is not None and len(X_va) > 0 and not train_with_val:
                 dval = xgb.DMatrix(X_va, label=y_va[:, cls_idx])
@@ -115,6 +123,9 @@ class MultiLabelTreeModel:
             self.estimators.append(booster)
             self.best_iterations.append(best_it)
 
+            del booster, dtrain, dval, evals, y_cls, uniq
+            self._release_host_memory()
+
         self.meta.fitted = True
         return self
 
@@ -131,8 +142,17 @@ class MultiLabelTreeModel:
             else:
                 p = est.predict(dtest, iteration_range=(0, int(best_it) + 1))
             probs.append(np.asarray(p, dtype=np.float32).reshape(-1))
+        del dtest
+        self._release_host_memory()
         return np.column_stack(probs).astype(np.float32, copy=False)
 
     def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         prob = self.predict_proba(X)
         return (prob >= float(threshold)).astype(np.int8, copy=False)
+
+    def release(self) -> None:
+        # Drop booster/estimator references aggressively between folds.
+        self.estimators.clear()
+        self.best_iterations = []
+        self.meta.fitted = False
+        self._release_host_memory()

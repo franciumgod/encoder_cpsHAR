@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import sys
 from datetime import datetime
@@ -12,6 +13,11 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
 
 if __package__ in {None, ""}:
     PACKAGE_PARENT = Path(__file__).resolve().parent.parent
@@ -354,6 +360,19 @@ def _inject_handcrafted_into_encoder_tensor(encoder_tensor: np.ndarray, handcraf
     raise ValueError(f"Unsupported encoder tensor ndim={enc.ndim}, expected 2D or 3D.")
 
 
+def _release_training_memory(include_cuda: bool = True) -> None:
+    gc.collect()
+    if include_cuda and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+        except Exception:
+            # Best-effort cache cleanup; should not break training.
+            pass
+
+
 def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
     requested_step = int(cfg.step)
     requested_sample_rate_hz = int(cfg.sample_rate_hz)
@@ -417,6 +436,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
     all_true: List[np.ndarray] = []
     all_pred: List[np.ndarray] = []
     all_timeline: List[np.ndarray] = []
+    label_cols_for_overall: List[str] | None = None
 
     for fold in cfg.folds:
         val_id = fold + 1 if fold < 4 else 1
@@ -427,6 +447,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             use_special_signal_combo=False,
             use_synth_signals=True,
         )
+        label_cols_for_overall = list(split.label_cols)
 
         X_train, _ = _ensure_nine_axis_windows(split.X_train, split.sensor_cols)
         X_val, _ = _ensure_nine_axis_windows(split.X_val, split.sensor_cols)
@@ -530,6 +551,11 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
                 }
             )
 
+            del projector, tr_enc_tensor, va_enc_tensor, te_enc_tensor
+            if not use_handcrafted_for_tree:
+                del tr_hand, va_hand, te_hand
+            _release_training_memory(include_cuda=True)
+
         if not train_enc_blocks:
             raise ValueError("No encoder features were produced.")
 
@@ -609,16 +635,26 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
         y_val_fit = val_tbl.iloc[:, -n_label:].to_numpy(dtype=np.int8, copy=False)
         X_test_fit = test_tbl.iloc[:, :-n_label].to_numpy(dtype=np.float32, copy=False)
         y_test_fit = test_tbl.iloc[:, -n_label:].to_numpy(dtype=np.int8, copy=False)
+        del train_tbl, val_tbl, test_tbl
 
         model = MultiLabelTreeModel(cfg=cfg, label_cols=split.label_cols)
-        model.fit(
-            X_train=X_train_fit,
-            y_train=y_train_fit,
-            X_val=X_val_fit,
-            y_val=y_val_fit,
-            train_with_val=False,
-        )
-        y_prob = model.predict_proba(X_test_fit)
+        try:
+            model.fit(
+                X_train=X_train_fit,
+                y_train=y_train_fit,
+                X_val=X_val_fit,
+                y_val=y_val_fit,
+                train_with_val=False,
+            )
+            y_prob = model.predict_proba(X_test_fit)
+            best_iterations_snapshot = [int(x) for x in model.best_iterations]
+        finally:
+            try:
+                model.release()
+            except Exception:
+                pass
+            del model
+            _release_training_memory(include_cuda=True)
         y_pred = (y_prob >= float(cfg.threshold)).astype(np.int8, copy=False)
 
         eval_result = evaluate_one_fold(
@@ -659,13 +695,45 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
             },
             "metrics": eval_result["metrics"],
             "plots": eval_result["plots"],
-            "xgb_best_iterations": [int(x) for x in model.best_iterations],
+            "xgb_best_iterations": best_iterations_snapshot,
         }
         run_summary["folds"].append(fold_row)
 
         all_true.append(y_test_fit)
         all_pred.append(y_pred)
         all_timeline.append(test_views["raw2000"]["X"])
+        del (
+            split,
+            train_views,
+            val_views,
+            test_views,
+            train_enc_blocks,
+            val_enc_blocks,
+            test_enc_blocks,
+            train_hand_blocks,
+            val_hand_blocks,
+            test_hand_blocks,
+            enc_train_concat,
+            enc_val_concat,
+            enc_test_concat,
+            enc_train_64,
+            enc_val_64,
+            enc_test_64,
+            X_train_model,
+            X_val_model,
+            X_test_model,
+            train_model_df,
+            val_model_df,
+            test_model_df,
+            X_train_fit,
+            y_train_fit,
+            X_val_fit,
+            y_val_fit,
+            X_test_fit,
+            y_prob,
+            zero_label_drop_stats,
+        )
+        _release_training_memory(include_cuda=True)
 
     run_summary["aggregate"] = aggregate_fold_metrics(run_summary["folds"])
     if all_true and all_pred:
@@ -675,7 +743,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
         overall_plots = plot_confusion_and_timeline(
             y_true=overall_true,
             y_pred=overall_pred,
-            class_names=split.label_cols,
+            class_names=label_cols_for_overall or [],
             fold_label="overall",
             X_for_timeline=timeline,
             save_dir=cfg.output_dir,
@@ -686,6 +754,7 @@ def run(cfg: EncoderBlockConfig, show_images: bool = False) -> Path:
     summary_path = cfg.output_dir / "run_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(to_jsonable(run_summary), f, ensure_ascii=False, indent=2)
+    _release_training_memory(include_cuda=True)
     return summary_path
 
 
